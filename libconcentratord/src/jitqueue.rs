@@ -15,6 +15,19 @@ pub enum TxMode {
     OnGPS,
 }
 
+/// Tracks the original intent of a queued packet so that priority and
+/// late-rescheduling decisions can be made after IMMEDIATE→Timestamped
+/// conversion.
+#[derive(PartialEq, Eq, Copy, Clone, Debug)]
+pub enum ItemType {
+    /// Timestamped or OnGPS downlink (Class A RX window, Class B ping slot).
+    /// These have a hard deadline — if the window is missed the packet is lost.
+    DownlinkScheduled,
+    /// Originally IMMEDIATE downlink converted to Timestamped (Class C).
+    /// Class C devices listen continuously, so the packet can be rescheduled.
+    DownlinkImmediate,
+}
+
 pub trait TxPacket {
     fn get_time_on_air(&self) -> Result<Duration>;
     fn get_tx_mode(&self) -> TxMode;
@@ -32,6 +45,7 @@ pub struct Item<T> {
     linear_count: Duration,
     pre_delay: Duration,
     post_delay: Duration,
+    item_type: ItemType,
     packet: T,
 }
 
@@ -91,30 +105,49 @@ impl<T: TxPacket + Copy> Queue<T> {
     pub fn pop(&mut self, concentrator_count: u32) -> Option<T> {
         let linear_count = self.get_linear_count(concentrator_count);
 
-        match self.items.first() {
-            None => {
-                // nothing in the queue
+        loop {
+            if self.items.is_empty() {
                 return None;
             }
-            Some(v) => {
-                if v.linear_count < linear_count {
-                    // it can happen if cpu load is too high but should normally
-                    // not happen.
-                    error!(
-                        "Scheduled packet is too old, dropped: count_us: {}, current_counter_us: {}",
-                        v.packet.get_count_us(),
-                        concentrator_count
+
+            if self.items[0].linear_count < linear_count {
+                // Packet's scheduled time has passed.
+                if self.items[0].item_type == ItemType::DownlinkImmediate {
+                    // Class C devices listen continuously — reschedule to now instead of
+                    // dropping. This can happen when the concentrator was busy transmitting
+                    // a previous packet.
+                    let new_count = linear_count + self.tx_jit_delay + self.tx_margin_delay;
+                    warn!(
+                        "Rescheduling late IMMEDIATE packet, downlink_id: {}, old_count_us: {}, new_count_us: {}",
+                        self.items[0].packet.get_id(),
+                        self.items[0].packet.get_count_us(),
+                        new_count.to_concentrator_count(),
                     );
-                    self.items.remove(0);
-                    return None;
+                    self.items[0].linear_count = new_count;
+                    self.items[0]
+                        .packet
+                        .set_count_us(new_count.to_concentrator_count());
+                    self.sort();
+                    continue; // Re-evaluate after re-sort
                 }
 
-                if v.linear_count - linear_count > v.pre_delay {
-                    // packet is too far in advance
-                    return None;
-                }
+                // Class A/B: RX window missed, drop the packet.
+                error!(
+                    "Scheduled packet is too old, dropped: count_us: {}, current_counter_us: {}",
+                    self.items[0].packet.get_count_us(),
+                    concentrator_count,
+                );
+                self.items.remove(0);
+                return None;
             }
-        };
+
+            if self.items[0].linear_count - linear_count > self.items[0].pre_delay {
+                // Packet is too far in advance
+                return None;
+            }
+
+            break; // Packet is ready for dequeue
+        }
 
         let item = self.items.remove(0);
 
@@ -203,17 +236,23 @@ impl<T: TxPacket + Copy> Queue<T> {
             }
         };
 
+        let original_tx_mode = packet.get_tx_mode();
+
         let mut item = Item {
             // linear_count depends on packet count_us, will be set later
             linear_count: Duration::from_micros(0),
             pre_delay: self.tx_start_delay + self.tx_jit_delay,
             post_delay: time_on_air,
+            item_type: match original_tx_mode {
+                TxMode::Immediate => ItemType::DownlinkImmediate,
+                _ => ItemType::DownlinkScheduled,
+            },
             packet,
         };
 
         // An immediate downlink becomes a timestamped downlink "ASAP".
         // Set the packet count_us to the first available slot.
-        if item.packet.get_tx_mode() == TxMode::Immediate {
+        if original_tx_mode == TxMode::Immediate {
             item.packet.set_tx_mode(TxMode::Timestamped);
 
             // use now + 1 sec
@@ -243,11 +282,12 @@ impl<T: TxPacket + Copy> Queue<T> {
             item.packet.set_count_us(asap_count.to_concentrator_count());
         } else {
             item.linear_count = self.concentrator_count_to_linear_count(item.packet.get_count_us());
-            if (item.packet.get_tx_mode() == TxMode::Timestamped
-                || item.packet.get_tx_mode() == TxMode::OnGPS)
-                && self.collision_test(item.linear_count, item.pre_delay, item.post_delay)
+            if item.packet.get_tx_mode() == TxMode::Timestamped
+                || item.packet.get_tx_mode() == TxMode::OnGPS
             {
-                return Err(gw::TxAckStatus::CollisionPacket);
+                // Scheduled packets (Class A/B) have priority over IMMEDIATE (Class C).
+                // If collision is with a Class C item, that item gets rescheduled.
+                self.resolve_collisions_for_scheduled(&item)?;
             }
         }
 
@@ -345,6 +385,78 @@ impl<T: TxPacket + Copy> Queue<T> {
             .sort_by(|a, b| a.linear_count.cmp(&b.linear_count))
     }
 
+    /// Check if a new item collides with a specific queued item at `queue_idx`.
+    fn item_collides_with(&self, new_item: &Item<T>, queue_idx: usize) -> bool {
+        let p2 = &self.items[queue_idx];
+        if new_item.linear_count > p2.linear_count {
+            new_item.linear_count - p2.linear_count
+                <= new_item.pre_delay + p2.post_delay + self.tx_margin_delay
+        } else {
+            p2.linear_count - new_item.linear_count
+                <= p2.pre_delay + new_item.post_delay + self.tx_margin_delay
+        }
+    }
+
+    /// Reschedule an IMMEDIATE (Class C) item to after all other packets including
+    /// a newly arriving scheduled item. This mirrors the sx1302_hal behavior where
+    /// Class A/B packets have priority over Class C.
+    fn reschedule_immediate(&mut self, idx: usize, new_scheduled_item: &Item<T>) {
+        // Find the latest end time among all packets (including the new scheduled one)
+        let mut latest_end = new_scheduled_item.linear_count + new_scheduled_item.post_delay;
+        for (j, p) in self.items.iter().enumerate() {
+            if j == idx {
+                continue;
+            }
+            let pkt_end = p.linear_count + p.post_delay;
+            if pkt_end > latest_end {
+                latest_end = pkt_end;
+            }
+        }
+        // Schedule IMMEDIATE after the latest packet to avoid any collision
+        let new_time =
+            latest_end + self.items[idx].pre_delay + self.tx_jit_delay + self.tx_margin_delay;
+        info!(
+            "Rescheduling IMMEDIATE downlink_id: {} from count_us {} to {} (priority to scheduled Class A/B)",
+            self.items[idx].packet.get_id(),
+            self.items[idx].packet.get_count_us(),
+            new_time.to_concentrator_count(),
+        );
+        self.items[idx].linear_count = new_time;
+        self.items[idx]
+            .packet
+            .set_count_us(new_time.to_concentrator_count());
+        self.sort();
+    }
+
+    /// For a scheduled (Class A/B) packet, resolve collisions with queued items.
+    /// If the collision is with a Class C (IMMEDIATE) item, reschedule that item.
+    /// If the collision is with another scheduled item, return CollisionPacket.
+    fn resolve_collisions_for_scheduled(&mut self, item: &Item<T>) -> Result<(), gw::TxAckStatus> {
+        // Collision with currently transmitting packet (already popped from queue)
+        if item.linear_count < self.tx_linear_count_finished + item.pre_delay + self.tx_margin_delay
+        {
+            return Err(gw::TxAckStatus::CollisionPacket);
+        }
+
+        let mut i = 0;
+        while i < self.items.len() {
+            if self.item_collides_with(item, i) {
+                if self.items[i].item_type == ItemType::DownlinkImmediate {
+                    // Class C yields to Class A/B — reschedule
+                    self.reschedule_immediate(i, item);
+                    // After sort, indices changed — restart check
+                    i = 0;
+                    continue;
+                }
+                // Collision with another Class A/B packet — reject
+                return Err(gw::TxAckStatus::CollisionPacket);
+            }
+            i += 1;
+        }
+
+        Ok(())
+    }
+
     fn collision_test(&self, count: Duration, pre_delay: Duration, post_delay: Duration) -> bool {
         if count < self.tx_linear_count_finished + pre_delay + self.tx_margin_delay {
             // a packet is currently running, then we need to take it into account
@@ -371,6 +483,7 @@ mod tests {
 
     #[derive(Copy, Clone)]
     struct TxPacketMock {
+        id: u32,
         time_on_air: Duration,
         tx_mode: TxMode,
         count_us: u32,
@@ -388,7 +501,7 @@ mod tests {
         }
 
         fn get_id(&self) -> u32 {
-            0
+            self.id
         }
 
         fn set_tx_mode(&mut self, tx_mode: TxMode) {
@@ -425,6 +538,7 @@ mod tests {
         q.enqueue(
             100,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Immediate,
                 count_us: 0,
@@ -437,6 +551,7 @@ mod tests {
         q.enqueue(
             100,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Immediate,
                 count_us: 0,
@@ -450,6 +565,7 @@ mod tests {
             q.enqueue(
                 100,
                 TxPacketMock {
+                    id: 0,
                     time_on_air: Duration::from_millis(100),
                     tx_mode: TxMode::Immediate,
                     count_us: 0,
@@ -470,6 +586,7 @@ mod tests {
         q.enqueue(
             concentrator_count,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Immediate,
                 count_us: 0,
@@ -482,6 +599,7 @@ mod tests {
         q.enqueue(
             concentrator_count,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Immediate,
                 count_us: 0,
@@ -527,6 +645,7 @@ mod tests {
         q.enqueue(
             concentrator_count,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Immediate,
                 count_us: 0,
@@ -539,6 +658,7 @@ mod tests {
         q.enqueue(
             concentrator_count,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Immediate,
                 count_us: 0,
@@ -571,6 +691,7 @@ mod tests {
         q.enqueue(
             concentrator_count,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Timestamped,
                 count_us: Duration::from_secs(2).as_micros() as u32,
@@ -592,6 +713,7 @@ mod tests {
         q.enqueue(
             concentrator_count,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Timestamped,
                 count_us: Duration::from_secs(2).as_micros() as u32,
@@ -613,6 +735,7 @@ mod tests {
         q.enqueue(
             concentrator_count,
             TxPacketMock {
+                id: 0,
                 time_on_air: Duration::from_millis(100),
                 tx_mode: TxMode::Timestamped,
                 count_us: 1,
@@ -624,5 +747,243 @@ mod tests {
 
         let item = q.pop(0_u32.wrapping_sub(100));
         assert!(item.is_some());
+    }
+
+    // --- Priority, rescheduling, and loss prevention tests ---
+
+    #[test]
+    fn test_enqueue_scheduled_preempts_immediate() {
+        // A Class A (Timestamped) packet that collides with a queued Class C (Immediate)
+        // should cause the Class C to be rescheduled, not reject the Class A.
+        let mut q: Queue<TxPacketMock> = Queue::new(4, None);
+        let t0: u32 = 1_000_000; // 1s
+
+        // Enqueue IMMEDIATE (Class C) — will be scheduled at t0 + 80ms = 1_080_000
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 1,
+                time_on_air: Duration::from_millis(100),
+                tx_mode: TxMode::Immediate,
+                count_us: 0,
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(1, q.items.len());
+        let imm_count_us = q.items[0].packet.get_count_us();
+        assert_eq!(ItemType::DownlinkImmediate, q.items[0].item_type);
+
+        // Enqueue Timestamped (Class A) that collides with the IMMEDIATE.
+        // Place it right at the IMMEDIATE's time.
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 2,
+                time_on_air: Duration::from_millis(50),
+                tx_mode: TxMode::Timestamped,
+                count_us: imm_count_us,
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(2, q.items.len());
+
+        // The scheduled (Class A) packet should be first (earlier time).
+        assert_eq!(2, q.items[0].packet.get_id());
+        assert_eq!(ItemType::DownlinkScheduled, q.items[0].item_type);
+        assert_eq!(imm_count_us, q.items[0].packet.get_count_us());
+
+        // The IMMEDIATE (Class C) should be rescheduled to after the scheduled packet.
+        assert_eq!(1, q.items[1].packet.get_id());
+        assert_eq!(ItemType::DownlinkImmediate, q.items[1].item_type);
+        assert!(
+            q.items[1].packet.get_count_us() > imm_count_us,
+            "IMMEDIATE should be rescheduled to later: {} > {}",
+            q.items[1].packet.get_count_us(),
+            imm_count_us,
+        );
+    }
+
+    #[test]
+    fn test_enqueue_scheduled_collision_with_scheduled() {
+        // Two Timestamped (Class A/B) packets that collide → CollisionPacket (unchanged behavior).
+        let mut q: Queue<TxPacketMock> = Queue::new(4, None);
+        let t0: u32 = 1_000_000;
+
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 1,
+                time_on_air: Duration::from_millis(100),
+                tx_mode: TxMode::Timestamped,
+                count_us: t0 + 500_000, // 500ms from now
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        // Second Timestamped at the same time — should collide
+        let result = q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 2,
+                time_on_air: Duration::from_millis(100),
+                tx_mode: TxMode::Timestamped,
+                count_us: t0 + 500_000,
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        );
+
+        assert_eq!(Err(gw::TxAckStatus::CollisionPacket), result);
+        assert_eq!(1, q.items.len(), "only the first packet should remain");
+    }
+
+    #[test]
+    fn test_pop_late_immediate_rescheduled() {
+        // A Class C (Immediate) packet whose scheduled time has passed should be
+        // rescheduled to "now" instead of dropped.
+        let mut q: Queue<TxPacketMock> = Queue::new(4, None);
+        let t0: u32 = 1_000_000;
+
+        // Enqueue IMMEDIATE — scheduled at t0 + 80ms = 1_080_000
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 1,
+                time_on_air: Duration::from_millis(50),
+                tx_mode: TxMode::Immediate,
+                count_us: 0,
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        let original_count_us = q.items[0].packet.get_count_us();
+        assert_eq!(t0 + 80_000, original_count_us);
+
+        // Pop much later — the packet's scheduled time has passed
+        let pop_time = t0 + 200_000; // 200ms later, well past the 80ms scheduled time
+        let result = q.pop(pop_time);
+
+        // The packet should be returned (rescheduled), not dropped
+        assert!(
+            result.is_some(),
+            "late IMMEDIATE should be rescheduled, not dropped"
+        );
+        let pkt = result.unwrap();
+        assert_eq!(1, pkt.get_id());
+
+        // Its count_us should be updated to a time after pop_time
+        assert!(
+            pkt.get_count_us() > pop_time,
+            "rescheduled count_us {} should be after pop time {}",
+            pkt.get_count_us(),
+            pop_time,
+        );
+    }
+
+    #[test]
+    fn test_pop_late_scheduled_dropped() {
+        // A Class A/B (Timestamped) packet whose scheduled time has passed should
+        // be dropped (RX window missed — unchanged behavior).
+        let mut q: Queue<TxPacketMock> = Queue::new(4, None);
+        let t0: u32 = 1_000_000;
+
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 1,
+                time_on_air: Duration::from_millis(50),
+                tx_mode: TxMode::Timestamped,
+                count_us: t0 + 500_000, // 500ms from now
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        // Pop much later — the packet's scheduled time has long passed
+        let pop_time = t0 + 1_000_000; // 1s later
+        let result = q.pop(pop_time);
+
+        assert!(result.is_none(), "late scheduled packet should be dropped");
+        assert!(q.items.is_empty(), "queue should be empty after drop");
+    }
+
+    #[test]
+    fn test_enqueue_multiple_immediates_rescheduled() {
+        // A Class A/B packet colliding with two Class C packets should reschedule both.
+        let mut q: Queue<TxPacketMock> = Queue::new(8, None);
+        let t0: u32 = 1_000_000;
+
+        // Enqueue two IMMEDIATE packets (they get sequential ASAP times)
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 1,
+                time_on_air: Duration::from_millis(50),
+                tx_mode: TxMode::Immediate,
+                count_us: 0,
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 2,
+                time_on_air: Duration::from_millis(50),
+                tx_mode: TxMode::Immediate,
+                count_us: 0,
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        let imm1_count = q.items[0].packet.get_count_us();
+        let _imm2_count = q.items[1].packet.get_count_us();
+
+        // Enqueue Timestamped (Class A) at the first IMMEDIATE's time — collides with both
+        q.enqueue(
+            t0,
+            TxPacketMock {
+                id: 3,
+                time_on_air: Duration::from_millis(50),
+                tx_mode: TxMode::Timestamped,
+                count_us: imm1_count,
+                frequency: 868100000,
+                tx_power: 14,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(3, q.items.len());
+
+        // The scheduled packet should now be first
+        assert_eq!(3, q.items[0].packet.get_id());
+        assert_eq!(ItemType::DownlinkScheduled, q.items[0].item_type);
+
+        // Both IMMEDIATE packets should have been rescheduled to after the scheduled one
+        for item in &q.items[1..] {
+            assert_eq!(ItemType::DownlinkImmediate, item.item_type);
+            assert!(
+                item.packet.get_count_us() > imm1_count,
+                "IMMEDIATE id={} should be rescheduled past original time {}, got {}",
+                item.packet.get_id(),
+                imm1_count,
+                item.packet.get_count_us(),
+            );
+        }
     }
 }

@@ -62,6 +62,27 @@ fn get_tx_packet(
     queue: &Arc<Mutex<jitqueue::Queue<wrapper::TxPacket>>>,
 ) -> Result<Option<wrapper::TxPacket>> {
     let mut queue = queue.lock().map_err(|_| anyhow!("Lock queue error"))?;
+
+    if queue.empty() {
+        return Ok(None);
+    }
+
+    // Check TX status before dequeue to avoid losing packets.
+    // If the concentrator is currently emitting, the packet stays in the queue
+    // and will be retried on the next 10ms iteration.
+    for rf_chain in 0..2u8 {
+        match hal::status(rf_chain, hal::StatusSelect::Tx)? {
+            hal::StatusReturn::Tx(hal::TxStatus::Emitting) => {
+                debug!(
+                    "Concentrator rf_chain {} is emitting, packet remains in queue",
+                    rf_chain
+                );
+                return Ok(None);
+            }
+            _ => {}
+        }
+    }
+
     let concentrator_count = hal::get_instcnt()?;
     Ok(queue.pop(concentrator_count))
 }
