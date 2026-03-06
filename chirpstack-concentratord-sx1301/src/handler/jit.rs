@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow::Result;
+use base64::Engine as _;
 
 use libconcentratord::jitqueue::TxPacket;
 use libconcentratord::signals::Signal;
@@ -38,15 +39,24 @@ pub fn jit_loop(
 
         match hal::send(&tx_packet) {
             Ok(_) => {
-                info!(
-                    "Scheduled packet for TX, downlink_id: {}, count_us: {}, freq: {}, bw: {}, mod: {:?}, dr: {:?}",
-                    downlink_id,
-                    tx_packet.count_us,
-                    tx_packet.freq_hz,
-                    tx_packet.bandwidth,
-                    tx_packet.modulation,
-                    tx_packet.datarate
-                );
+                if log::log_enabled!(log::Level::Info) {
+                    let payload_size = (tx_packet.size as usize).min(tx_packet.payload.len());
+                    let payload = base64::engine::general_purpose::STANDARD
+                        .encode(&tx_packet.payload[..payload_size]);
+                    info!(
+                        "Scheduled packet for TX, downlink_id: {}, count_us: {}, freq: {}, bw: {}, mod: {:?}, dr: {:?}, coderate: {:?}, rf_power: {}, size: {}, payload: {}",
+                        downlink_id,
+                        tx_packet.count_us,
+                        tx_packet.freq_hz,
+                        tx_packet.bandwidth,
+                        tx_packet.modulation,
+                        tx_packet.datarate,
+                        tx_packet.coderate,
+                        tx_packet.rf_power,
+                        tx_packet.size,
+                        payload
+                    );
+                }
 
                 if let Ok(tx_info) = wrapper::downlink_to_tx_info_proto(&tx_packet) {
                     stats::inc_tx_counts(&tx_info);

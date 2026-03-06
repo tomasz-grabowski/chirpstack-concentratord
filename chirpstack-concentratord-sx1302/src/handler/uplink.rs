@@ -3,6 +3,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use base64::{engine::general_purpose::STANDARD, Engine as _};
 
 use libconcentratord::signals::Signal;
 use libconcentratord::{events, stats};
@@ -48,18 +49,27 @@ pub fn handle_loop(
                         .rx_info
                         .as_ref()
                         .ok_or_else(|| anyhow!("rx_info is None"))?;
+                    if log::log_enabled!(log::Level::Info) {
+                        let payload = STANDARD.encode(&frame.payload[..frame.size as usize]);
 
-                    info!(
-                        "Frame received, uplink_id: {}, count_us: {}, freq: {}, bw: {}, mod: {:?}, dr: {:?}, ftime_received: {}, ftime_ns: {}",
-                        rx_info.uplink_id,
-                        frame.count_us,
-                        frame.freq_hz,
-                        frame.bandwidth,
-                        frame.modulation,
-                        frame.datarate,
-                        frame.ftime_received,
-                        frame.ftime,
-                    );
+                        info!(
+                            "Frame received, uplink_id: {}, count_us: {}, freq: {}, bw: {}, mod: {:?}, dr: {:?}, coderate: {:?}, rssis: {}, rssic: {}, snr: {}, size: {}, data: {}, ftime_received: {}, ftime_ns: {}",
+                            rx_info.uplink_id,
+                            frame.count_us,
+                            frame.freq_hz,
+                            frame.bandwidth,
+                            frame.modulation,
+                            frame.datarate,
+                            frame.coderate,
+                            frame.rssis,
+                            frame.rssic,
+                            frame.snr,
+                            frame.size,
+                            payload,
+                            frame.ftime_received,
+                            frame.ftime,
+                        );
+                    }
 
                     if frame.status == hal::CRC::CRCOk {
                         stats::inc_rx_counts(&proto);

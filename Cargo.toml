@@ -28,6 +28,7 @@
       "derive",
     ] }
     log = "0.4"
+    base64 = "0.22"
     simple_logger = { version = "5.2", default-features = false, features = [
       "timestamps",
     ] }
